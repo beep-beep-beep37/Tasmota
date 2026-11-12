@@ -1,0 +1,46 @@
+
+name: Build Tasmota OpenTherm
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Tasmota
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install build tools
+        run: |
+          python -m pip install pioarduino==6.2.0
+          cp platformio_override_sample.ini platformio_override.ini
+
+      - name: Enable OpenTherm
+        run: |
+          cat > tasmota/user_config_override.h <<'EOF'
+          #ifndef _USER_CONFIG_OVERRIDE_H_
+          #define _USER_CONFIG_OVERRIDE_H_
+
+          #define USE_OPENTHERM
+
+          #endif
+          EOF
+
+      - name: Compile ESP8266 firmware
+        run: platformio run -e tasmota
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: tasmota-opentherm-esp8266
+          path: build_output/
