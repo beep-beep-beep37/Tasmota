@@ -26,15 +26,33 @@ jobs:
           cp platformio_override_sample.ini platformio_override.ini
 
 
-      - name: Enable OpenTherm for heat pump
+
+      - name: Configure OpenTherm Lite
         run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("tasmota/include/tasmota_configurations.h")
+          s = p.read_text()
+
+          start = s.index("#ifdef FIRMWARE_LITE")
+          end = s.index("#endif  // FIRMWARE_LITE", start)
+
+          block = s[start:end]
+          target = "#undef USE_OPENTHERM"
+          assert block.count(target) == 1
+
+          block = block.replace(target, "// " + target)
+          p.write_text(s[:start] + block + s[end:])
+          PY
+
           cat > tasmota/user_config_override.h <<'EOF'
           #ifndef _USER_CONFIG_OVERRIDE_H_
           #define _USER_CONFIG_OVERRIDE_H_
 
           #define USE_OPENTHERM
 
-          // Low-temperature heat pump
+          // Heat pump
           #define OT_BOILER_MIN 20
           #define OT_BOILER_MAX 45
           #define OT_BOILER_DEFAULT 33
@@ -45,9 +63,20 @@ jobs:
           #endif
           EOF
 
+          cat >> platformio_override.ini <<'EOF'
 
-      - name: Compile ESP8266 firmware
-        run: platformio run -e tasmota
+          [env:tasmota-lite]
+          lib_extra_dirs = lib/lib_div
+          EOF
+
+      - name: Compile OpenTherm Lite
+        run: platformio run -e tasmota-lite
+
+      - name: Show firmware sizes
+        run: |
+          ls -lh build_output/firmware/*lite*
+
+
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
