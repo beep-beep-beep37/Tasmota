@@ -87,6 +87,48 @@ static bool sns_ot_read_pending;
 static bool sns_ot_read_inflight;
 static bool sns_ot_read_wait_for_poll;
 
+constexpr uint32_t SNS_OT_SCAN_INTERVAL_MS = 1000;
+static uint32_t sns_ot_scan_last_sent;
+static bool sns_ot_scan_cooldown;
+static struct {
+    bool active;
+    bool stop;
+    uint16_t first;
+    uint16_t next;
+    uint16_t last;
+    uint8_t ack_ids[32];
+    uint16_t ack_count;
+    uint16_t unknown_count;
+    uint16_t invalid_count;
+    uint16_t timeout_count;
+} sns_ot_scan;
+
+static void sns_opentherm_scan_finish(const char *reason)
+{
+    sns_ot_scan.active = false;
+    AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: ot_scan %u-%u %s: READ_ACK=%u UNKNOWN_DATA_ID=%u Invalid=%u TIMEOUT=%u Skipped=%u Untried=%u"),
+           (unsigned)sns_ot_scan.first, (unsigned)sns_ot_scan.last, reason,
+           (unsigned)sns_ot_scan.ack_count, (unsigned)sns_ot_scan.unknown_count,
+           (unsigned)sns_ot_scan.invalid_count, (unsigned)sns_ot_scan.timeout_count,
+           (unsigned)(sns_ot_scan.first == 0), (unsigned)(sns_ot_scan.last + 1 - sns_ot_scan.next));
+
+    // Keep each log line short even if the entire range acknowledges.
+    char ids[16 * 4 + 1];
+    unsigned used = 0;
+    for (unsigned id = sns_ot_scan.first; id < sns_ot_scan.next; ++id)
+    {
+        if (sns_ot_scan.ack_ids[id / 8] & (1u << (id % 8)))
+        {
+            used += snprintf_P(ids + used, sizeof(ids) - used, PSTR(" %u"), id);
+        }
+        if (used && ((id % 16 == 15) || id + 1 == sns_ot_scan.next))
+        {
+            AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: ot_scan READ_ACK IDs:%s"), ids);
+            used = 0;
+        }
+    }
+}
+
 // Has valid values if connection status is READY or INFLIGHT
 typedef struct OT_BOILER_STATUS_T
 {
@@ -203,25 +245,51 @@ void sns_opentherm_processResponseCallback(unsigned long response, int st)
     {
         sns_ot_read_inflight = false;
         sns_ot_connection_status = OpenThermConnectionStatus::OTC_READY;
+        const char *command = sns_ot_scan.active ? "ot_scan" : "ot_read";
         if (status == OpenThermResponseStatus::TIMEOUT)
         {
-            AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: ot_read %u TIMEOUT"), (unsigned)sns_ot_read_id);
-            return;
+            AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: %s %u TIMEOUT"), command, (unsigned)sns_ot_read_id);
+            if (sns_ot_scan.active)
+            {
+                ++sns_ot_scan.timeout_count;
+            }
         }
-
-        const auto type = OpenTherm::getMessageType(response);
-        const char *result = "INVALID";
-        if (!OpenTherm::parity(response) &&
-            OpenTherm::getDataID(response) == static_cast<OpenThermMessageID>(sns_ot_read_id))
+        else
         {
-            if ((status == OpenThermResponseStatus::SUCCESS && type == OpenThermMessageType::READ_ACK) ||
-                type == OpenThermMessageType::DATA_INVALID || type == OpenThermMessageType::UNKNOWN_DATA_ID)
+            const auto type = OpenTherm::getMessageType(response);
+            const bool matching = !OpenTherm::parity(response) &&
+                OpenTherm::getDataID(response) == static_cast<OpenThermMessageID>(sns_ot_read_id);
+            const bool ack = matching && status == OpenThermResponseStatus::SUCCESS &&
+                type == OpenThermMessageType::READ_ACK;
+            const bool unknown = matching && type == OpenThermMessageType::UNKNOWN_DATA_ID;
+            const char *result = "INVALID";
+            if (ack || unknown || (matching && type == OpenThermMessageType::DATA_INVALID))
             {
                 result = OpenTherm::messageTypeToString(type);
             }
+            AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: %s %u %s Raw=0x%08lX Data=0x%04lX"),
+                   command, (unsigned)sns_ot_read_id, result, response, response & 0xFFFFul);
+            if (sns_ot_scan.active)
+            {
+                if (ack)
+                {
+                    sns_ot_scan.ack_ids[sns_ot_read_id / 8] |= 1u << (sns_ot_read_id % 8);
+                    ++sns_ot_scan.ack_count;
+                }
+                else if (unknown)
+                {
+                    ++sns_ot_scan.unknown_count;
+                }
+                else
+                {
+                    ++sns_ot_scan.invalid_count;
+                }
+            }
         }
-        AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: ot_read %u %s Raw=0x%08lX Data=0x%04lX"),
-               (unsigned)sns_ot_read_id, result, response, response & 0xFFFFul);
+        if (sns_ot_scan.active && (sns_ot_scan.stop || sns_ot_scan.next > sns_ot_scan.last))
+        {
+            sns_opentherm_scan_finish(sns_ot_scan.stop ? "Cancelled" : "Done");
+        }
         return;
     }
 
@@ -251,6 +319,10 @@ void sns_opentherm_processResponseCallback(unsigned long response, int st)
         if (--sns_ot_timeout_before_disconnect == 0)
         {
             sns_ot_connection_status = OpenThermConnectionStatus::OTC_DISCONNECTED;
+            if (sns_ot_scan.active)
+            {
+                sns_opentherm_scan_finish("Disconnected");
+            }
             if (sns_ot_read_pending)
             {
                 sns_ot_read_pending = false;
@@ -539,6 +611,7 @@ uint8_t sns_opentherm_read_flags(char *data, uint32_t len)
 // BLOR - Reset boiler 
 #define D_CMND_BLLOR "blor"
 #define D_CMND_OTHERM_READ "read"
+#define D_CMND_OTHERM_SCAN "scan"
 
 void sns_opentherm_read_cmd(void)
 {
@@ -559,7 +632,7 @@ void sns_opentherm_read_cmd(void)
         ResponseCmndChar(PSTR("Use ot_read <1-255>"));
         return;
     }
-    if (sns_ot_read_pending || sns_ot_read_inflight)
+    if (sns_ot_read_pending || sns_ot_read_inflight || sns_ot_scan.active)
     {
         ResponseCmndChar(PSTR("Busy"));
         return;
@@ -574,9 +647,94 @@ void sns_opentherm_read_cmd(void)
     ResponseCmndChar(PSTR("Queued"));
 }
 
+static bool sns_opentherm_scan_parse_id(const char *&data, uint16_t &id)
+{
+    if (*data < '0' || *data > '9')
+    {
+        return false;
+    }
+    id = 0;
+    do
+    {
+        id = id * 10 + (*data++ - '0');
+        if (id > 255)
+        {
+            return false;
+        }
+    } while (*data >= '0' && *data <= '9');
+    return true;
+}
+
+void sns_opentherm_scan_cmd(void)
+{
+    const char *data = XdrvMailbox.data;
+    if (!XdrvMailbox.usridx && (!strcasecmp(data, "stop") || !strcasecmp(data, "cancel")))
+    {
+        if (!sns_ot_scan.active)
+        {
+            ResponseCmndChar(PSTR("Idle"));
+        }
+        else if (sns_ot_read_inflight)
+        {
+            sns_ot_scan.stop = true;
+            ResponseCmndChar(PSTR("Stopping"));
+        }
+        else
+        {
+            sns_opentherm_scan_finish("Cancelled");
+            ResponseCmndChar(PSTR("Cancelled"));
+        }
+        return;
+    }
+
+    uint16_t first, last;
+    bool valid = !XdrvMailbox.usridx && sns_opentherm_scan_parse_id(data, first) &&
+        (*data == ' ' || *data == '\t');
+    if (valid)
+    {
+        data += strspn(data, " \t");
+        valid = sns_opentherm_scan_parse_id(data, last) && first <= last &&
+            !data[strspn(data, " \t")];
+    }
+    if (!valid)
+    {
+        ResponseCmndChar(PSTR("Use ot_scan <start> <end> (0-255) or ot_scan stop"));
+        return;
+    }
+    if (sns_ot_scan.active || sns_ot_read_pending || sns_ot_read_inflight)
+    {
+        ResponseCmndChar(PSTR("Busy"));
+        return;
+    }
+    if (sns_ot_connection_status < OpenThermConnectionStatus::OTC_READY)
+    {
+        ResponseCmndChar(PSTR("Not connected"));
+        return;
+    }
+
+    sns_ot_scan = {};
+    sns_ot_scan.active = true;
+    sns_ot_scan.first = first;
+    sns_ot_scan.next = first;
+    sns_ot_scan.last = last;
+    // ID 0 READ_DATA carries the live master control flags.
+    if (first == 0)
+    {
+        ++sns_ot_scan.next;
+        AddLog(LOG_LEVEL_INFO, PSTR("[OTH]: ot_scan 0 SKIPPED (master control flags)"));
+        if (last == 0)
+        {
+            sns_opentherm_scan_finish("Done");
+            ResponseCmndChar(PSTR("Skipped ID 0"));
+            return;
+        }
+    }
+    ResponseCmndChar(PSTR("Started"));
+}
+
 const char kOpenThermCommands[] PROGMEM = D_PRFX_OTHERM "|" D_CMND_OTHERM_BOILER_SETPOINT "|" D_CMND_OTHERM_DHW_SETPOINT
 	    "|" D_CMND_OTHERM_SAVE_SETTINGS "|" D_CMND_OTHERM_FLAGS "|" D_CMND_SET_CENTRAL_HEATING_ENABLED "|" D_CMND_SET_HOT_WATER_ENABLED "|" D_CMND_BLLOR
-        "|" D_CMND_OTHERM_READ;
+        "|" D_CMND_OTHERM_READ "|" D_CMND_OTHERM_SCAN;
 
 void (*const OpenThermCommands[])(void) PROGMEM = {
     &sns_opentherm_boiler_setpoint_cmd,
@@ -586,7 +744,8 @@ void (*const OpenThermCommands[])(void) PROGMEM = {
     &sns_opentherm_set_central_heating_cmd,
     &sns_opentherm_set_hot_water_cmd,
     &sns_opentherm_blor_cmd,
-    &sns_opentherm_read_cmd,};
+    &sns_opentherm_read_cmd,
+    &sns_opentherm_scan_cmd,};
 
 void sns_opentherm_cmd(void) { }
 void sns_opentherm_boiler_setpoint_cmd(void)
@@ -715,10 +874,21 @@ bool Xsns69(uint32_t function)
         sns_ot_master->process();
         break;
     case FUNC_EVERY_100_MSECOND:
+        if (sns_ot_scan_cooldown && millis() - sns_ot_scan_last_sent >= SNS_OT_SCAN_INTERVAL_MS)
+        {
+            sns_ot_scan_cooldown = false;
+        }
         if (sns_ot_connection_status == OpenThermConnectionStatus::OTC_READY && sns_ot_master->isReady())
         {
-            if (sns_ot_read_pending && !sns_ot_read_wait_for_poll)
+            const bool scan_due = sns_ot_scan.active &&
+                !sns_ot_scan_cooldown &&
+                sns_ot_timeout_before_disconnect == SNS_OT_MAX_TIMEOUTS_BEFORE_DISCONNECT;
+            if ((sns_ot_read_pending || scan_due) && !sns_ot_read_wait_for_poll)
             {
+                if (scan_due)
+                {
+                    sns_ot_read_id = sns_ot_scan.next;
+                }
                 const auto request = OpenTherm::buildRequest(OpenThermMessageType::READ_DATA,
                     static_cast<OpenThermMessageID>(sns_ot_read_id), 0);
                 if (sns_ot_master->sendRequestAsync(request))
@@ -727,6 +897,12 @@ bool Xsns69(uint32_t function)
                     sns_ot_read_inflight = true;
                     sns_ot_read_wait_for_poll = true;
                     sns_ot_connection_status = OpenThermConnectionStatus::OTC_INFLIGHT;
+                    if (scan_due)
+                    {
+                        sns_ot_scan_last_sent = millis();
+                        sns_ot_scan_cooldown = true;
+                        ++sns_ot_scan.next;
+                    }
                 }
                 break;
             }
