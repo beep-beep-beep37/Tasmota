@@ -371,20 +371,24 @@ void sns_ot_process_handshake(unsigned long response, int st)
 
 void sns_opentherm_check_settings(void)
 {
-    bool settingsValid = true;
-
-    settingsValid &= Settings->ot_hot_water_setpoint >= OT_HOT_WATER_MIN;
-    settingsValid &= Settings->ot_hot_water_setpoint <= OT_HOT_WATER_MAX;
-    settingsValid &= Settings->ot_boiler_setpoint >= OT_BOILER_MIN;
-    settingsValid &= Settings->ot_boiler_setpoint <= OT_BOILER_MAX;
-
-    if (!settingsValid)
+    // A fresh settings block has no OpenTherm setpoints or flags.
+    if (Settings->ot_hot_water_setpoint == 0 && Settings->ot_boiler_setpoint == 0 &&
+        Settings->ot_flags == 0)
     {
-        Settings->ot_hot_water_setpoint = OT_HOT_WATER_DEFAULT;
-        Settings->ot_boiler_setpoint = OT_BOILER_DEFAULT;
         Settings->ot_flags =
             OpenThermSettingsFlags::EnableCentralHeatingOnDiagnostics |
             OpenThermSettingsFlags::EnableHotWater;
+    }
+
+    if (Settings->ot_hot_water_setpoint < OT_HOT_WATER_MIN ||
+        Settings->ot_hot_water_setpoint > OT_HOT_WATER_MAX)
+    {
+        Settings->ot_hot_water_setpoint = OT_HOT_WATER_DEFAULT;
+    }
+    if (Settings->ot_boiler_setpoint < OT_BOILER_MIN ||
+        Settings->ot_boiler_setpoint > OT_BOILER_MAX)
+    {
+        Settings->ot_boiler_setpoint = OT_BOILER_DEFAULT;
     }
 }
 /*********************************************************************************************\
@@ -521,7 +525,13 @@ void sns_opentherm_boiler_setpoint_cmd(void)
     float *setpoint = (2 == XdrvMailbox.index) ? &sns_ot_boiler_status.m_boilerSetpoint2 : &sns_ot_boiler_status.m_boilerSetpoint;
     if (!query)
     {
-        *setpoint = CharToFloat(XdrvMailbox.data);
+        const float temperature = CharToFloat(XdrvMailbox.data);
+        if (!(temperature >= OT_BOILER_MIN && temperature <= OT_BOILER_MAX))
+        {
+            ResponseCmndFailed();
+            return;
+        }
+        *setpoint = temperature;
     }
     if (2 == XdrvMailbox.index)
     {
@@ -538,7 +548,13 @@ void sns_opentherm_hot_water_setpoint_cmd(void)
     bool query = strlen(XdrvMailbox.data) == 0;
     if (!query)
     {
-        sns_ot_boiler_status.m_hotWaterSetpoint = CharToFloat(XdrvMailbox.data);
+        const float temperature = CharToFloat(XdrvMailbox.data);
+        if (!(temperature >= OT_HOT_WATER_MIN && temperature <= OT_HOT_WATER_MAX))
+        {
+            ResponseCmndFailed();
+            return;
+        }
+        sns_ot_boiler_status.m_hotWaterSetpoint = temperature;
     }
     ResponseCmndFloat(sns_ot_boiler_status.m_hotWaterSetpoint, Settings->flag2.temperature_resolution);
 }
