@@ -58,7 +58,9 @@ jobs:
           #define OT_BOILER_DEFAULT 33
 
           // Domestic hot water
-          #define OT_HOT_WATER_DEFAULT 40
+          #define OT_HOT_WATER_DEFAULT 45
+          #define OT_HOT_WATER_MIN     23
+          #define OT_HOT_WATER_MAX     65
 
           #endif
           EOF
